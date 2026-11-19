@@ -357,7 +357,12 @@ const CONFIG = {
   music: { src: 'audio/atap.mp3', title: 'Kota Ini Tak Sama Tanpamu', artist: 'Nadhif Basalamah' },
   // Video anniversary untuk layar. Kosong = tayangan foto otomatis dari PHOTOS.
   // Setelah videonya ada, isi misalnya 'video/anniversary.mp4'.
-  video: ''
+  video: '',
+  // Mode online & papan pesan di luar claude.ai (GitHub Pages, Netlify, dll.) lewat Firebase. Lihat README.
+  online: {
+    firebase: null,   // tempel firebaseConfig di sini: { apiKey, authDomain, databaseURL, projectId, appId }
+    room: ''          // kode ruang bawaan, opsional (bisa juga lewat ?ruang=... di URL)
+  }
 };
 // Foto kenangan di lantai 1 (urutan = urutan di dinding). Judul dan cerita bisa diganti; tanggal boleh dikosongkan.
 const PHOTOS = [
@@ -1952,9 +1957,120 @@ function renderNotes(list) {
     m.userData.note = nt; noteMeshes.push(m); noteGroup.add(m);
   });
 }
+/* ---------- Capabilities: Claude artifact runtime on claude.ai, Firebase elsewhere, otherwise null (solo) ---------- */
+const FB_VER = '10.12.2', FB_CDN = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+let fbPromise = null;
+function fbRoomId() {
+  let r = '';
+  try { r = new URLSearchParams(location.search).get('ruang') || ''; } catch (e) { r = ''; }
+  if (!r) r = (CONFIG.online && CONFIG.online.room) || '';
+  return String(r).toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40);
+}
+function fbInit() {
+  if (fbPromise) return fbPromise;
+  fbPromise = (async () => {
+    const cfg = CONFIG.online && CONFIG.online.firebase, roomId = fbRoomId();
+    if (!cfg || typeof cfg !== 'object' || !roomId) return null;
+    const [appM, authM, dbM] = await Promise.all([
+      import(FB_CDN + 'firebase-app.js'), import(FB_CDN + 'firebase-auth.js'), import(FB_CDN + 'firebase-database.js')
+    ]);
+    const app = appM.initializeApp(cfg, 'museum-online');
+    const auth = authM.getAuth(app);
+    if (!auth.currentUser) await authM.signInAnonymously(auth);
+    const uid = auth.currentUser && auth.currentUser.uid;
+    if (!uid) return null;
+    const fdb = dbM.getDatabase(app);
+    return { m: dbM, db: fdb, uid, roomId, base: `rooms/${roomId}` };
+  })().catch((e) => { console.warn('Firebase tidak tersedia, main sendiri.', e); return null; });
+  return fbPromise;
+}
+const fbClean = (v) => JSON.parse(JSON.stringify(v === undefined ? null : v));
+function fbRoom(fb) {
+  const { m, db: fdb, uid, base } = fb;
+  const peerId = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  const myRef = m.ref(fdb, `${base}/presence/${peerId}`);
+  const STALE = 60000, MIN_GAP = 125, BEAT = 20000;
+  let last = null, lastWrite = 0, timer = 0, connected = false, offset = 0, raw = {}, peers = [];
+  const peerCbs = [];
+  const write = () => {
+    timer = 0;
+    if (!last || !connected) return;
+    lastWrite = Date.now();
+    m.set(myRef, { uid, presence: last, t: m.serverTimestamp() }).catch(() => {});
+  };
+  const schedule = () => {
+    if (timer) return;
+    const wait = Math.max(0, MIN_GAP - (Date.now() - lastWrite));
+    timer = setTimeout(write, wait);
+  };
+  const rebuild = () => {
+    const now = Date.now() + offset;
+    peers = Object.entries(raw || {})
+      .filter(([, v]) => v && v.presence && typeof v.presence === 'object' && (typeof v.t !== 'number' || now - v.t < STALE))
+      .map(([id, v]) => ({ peer: id, kind: 'viewer', sameTab: id === peerId, presence: v.presence }));
+    peerCbs.forEach((cb) => { try { cb({ peers }); } catch (e) { /* game handler error */ } });
+  };
+  try { m.onValue(m.ref(fdb, '.info/serverTimeOffset'), (s) => { offset = Number(s.val()) || 0; }); } catch (e) { /* ignore */ }
+  // Heartbeat keeps a still-standing player from looking stale; periodic rebuild drops crashed tabs.
+  setInterval(() => { if (last && Date.now() - lastWrite > BEAT) schedule(); rebuild(); }, 10000);
+  return {
+    presence(obj) {
+      try { last = fbClean(obj); schedule(); } catch (e) { /* ignore */ }
+      return Promise.resolve();
+    },
+    onConnection(cb, onError) {
+      m.onValue(m.ref(fdb, '.info/connected'), (s) => {
+        connected = s.val() === true;
+        if (connected) {
+          m.onDisconnect(myRef).remove().catch(() => {});
+          if (last) schedule();
+        }
+        cb(connected);
+      }, (e) => { if (onError) onError(e); });
+    },
+    onPeers(cb, onError) {
+      peerCbs.push(cb);
+      m.onValue(m.ref(fdb, `${base}/presence`), (s) => { raw = s.val() || {}; rebuild(); }, (e) => { if (onError) onError(e); });
+    },
+    peers() { return peers.slice(); }
+  };
+}
+function fbDb(fb) {
+  const { m, db: fdb, base } = fb;
+  return {
+    collection(name) {
+      return {
+        onSnapshot(cb, onError) {
+          m.onValue(m.ref(fdb, `${base}/${name}`), (s) => {
+            const val = s.val() || {};
+            cb({ docs: Object.entries(val).map(([id, v]) => ({ id, data: () => v })) });
+          }, (e) => { if (onError) onError(e); });
+        }
+      };
+    },
+    doc(path) {
+      return { set: (value) => m.set(m.ref(fdb, `${base}/${path}`), fbClean(value)) };
+    }
+  };
+}
+const fbCaps = {};
+async function getCapability(name) {
+  if (window.claude && typeof window.claude.use === 'function') return window.claude.use(name);
+  try {
+    const fb = await fbInit();
+    if (!fb) return null;
+    if (!fbCaps[name]) {
+      if (name === 'room') fbCaps.room = fbRoom(fb);
+      else if (name === 'db') fbCaps.db = fbDb(fb);
+      else if (name === 'user') fbCaps.user = { id: async () => fb.uid };
+      else return null;
+    }
+    return fbCaps[name];
+  } catch (e) { return null; }
+}
 async function connectNotes() {
-  try { db = window.claude && typeof window.claude.use === 'function' ? await window.claude.use('db') : null; } catch (e) { db = null; }
-  try { userCap = window.claude && typeof window.claude.use === 'function' ? await window.claude.use('user') : null; } catch (e) { userCap = null; }
+  try { db = await getCapability('db'); } catch (e) { db = null; }
+  try { userCap = await getCapability('user'); } catch (e) { userCap = null; }
   if (userCap) { try { myUid = await userCap.id(); } catch (e) { myUid = null; } }
   if (!db) return;
   try {
@@ -3012,7 +3128,7 @@ function publishPresence() {
   room.presence({ g }).catch(() => {});
 }
 async function connectRoom() {
-  try { room = window.claude && typeof window.claude.use === 'function' ? await window.claude.use('room') : null; } catch (e) { room = null; }
+  try { room = await getCapability('room'); } catch (e) { room = null; }
   if (!room) { setOnline('off'); return; }
   setOnline('connecting');
   const fail = () => { room = null; dropRemote(); setOnline('off'); };
