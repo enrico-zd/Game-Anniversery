@@ -360,7 +360,15 @@ const CONFIG = {
   video: '',
   // Mode online & papan pesan di luar claude.ai (GitHub Pages, Netlify, dll.) lewat Firebase. Lihat README.
   online: {
-    firebase: null,   // tempel firebaseConfig di sini: { apiKey, authDomain, databaseURL, projectId, appId }
+    firebase: {
+      apiKey: 'AIzaSyC33WTib7Yo-bmQ8N5_91YHgU686QeP6dE',
+      authDomain: 'aniv-1y.firebaseapp.com',
+      databaseURL: 'https://aniv-1y-default-rtdb.asia-southeast1.firebasedatabase.app',
+      projectId: 'aniv-1y',
+      storageBucket: 'aniv-1y.firebasestorage.app',
+      messagingSenderId: '795092909051',
+      appId: '1:795092909051:web:bcc15a1416bd381c70a95e'
+    },
     room: ''          // kode ruang bawaan, opsional (bisa juga lewat ?ruang=... di URL)
   }
 };
